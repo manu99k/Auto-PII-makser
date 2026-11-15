@@ -1,0 +1,7 @@
+pymupdf>=1.24.0
+faker>=24.0.0
+tqdm>=4.66.0
+
+# Optional: enable spaCy + Microsoft Presidio NER via --engine presidio
+# presidio-analyzer>=2.2.35
+# spacy>=3.7.0
