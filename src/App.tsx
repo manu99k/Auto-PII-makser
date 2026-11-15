@@ -50,6 +50,17 @@ export default function App() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
+  const readJsonSafe = async (res: Response) => {
+    const text = await res.text();
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new Error(
+        `Server returned HTTP ${res.status} (${res.statusText || 'Error'}): ${text.slice(0, 140)}`
+      );
+    }
+  };
+
   const handleUploadFiles = useCallback(
     async (fileList: FileList, replaceExisting: boolean) => {
       setErrorMessage(null);
@@ -73,16 +84,36 @@ export default function App() {
           return;
         }
 
-        // Upload in chunks of 100 so even 1,000 PDFs upload reliably without request limits
-        const CHUNK_SIZE = 100;
+        // Upload in size-and-count-bounded chunks (max 25 files or 35MB per request)
+        const MAX_CHUNK_FILES = 25;
+        const MAX_CHUNK_BYTES = 35 * 1024 * 1024;
         let latestFiles: UploadedFileSummary[] = [];
-        for (let offset = 0; offset < pdfFiles.length; offset += CHUNK_SIZE) {
+        let index = 0;
+        let chunkIndex = 0;
+
+        while (index < pdfFiles.length) {
+          const chunkFiles: File[] = [];
+          const chunkPaths: string[] = [];
+          let chunkBytes = 0;
+
+          while (index < pdfFiles.length) {
+            const nextFile = pdfFiles[index];
+            if (
+              chunkFiles.length > 0 &&
+              (chunkFiles.length >= MAX_CHUNK_FILES ||
+                chunkBytes + nextFile.size > MAX_CHUNK_BYTES)
+            ) {
+              break;
+            }
+            chunkFiles.push(nextFile);
+            chunkPaths.push(relativePaths[index]);
+            chunkBytes += nextFile.size;
+            index++;
+          }
+
           const form = new FormData();
           form.append('workspaceId', workspaceId);
-          form.append('replaceExisting', String(replaceExisting && offset === 0));
-
-          const chunkFiles = pdfFiles.slice(offset, offset + CHUNK_SIZE);
-          const chunkPaths = relativePaths.slice(offset, offset + CHUNK_SIZE);
+          form.append('replaceExisting', String(replaceExisting && chunkIndex === 0));
           form.append('relativePaths', JSON.stringify(chunkPaths));
 
           for (const f of chunkFiles) {
@@ -93,11 +124,12 @@ export default function App() {
             method: 'POST',
             body: form,
           });
-          const data = await res.json();
+          const data = await readJsonSafe(res);
           if (!res.ok) {
             throw new Error(data.error || 'Failed to upload PDFs');
           }
           latestFiles = data.files || [];
+          chunkIndex++;
         }
 
         setStagedFiles(latestFiles);
@@ -126,7 +158,7 @@ export default function App() {
             replaceExisting: true,
           }),
         });
-        const data = await res.json();
+        const data = await readJsonSafe(res);
         if (!res.ok) {
           throw new Error(data.error || 'Failed to generate sample PDFs');
         }
@@ -169,7 +201,7 @@ export default function App() {
           outputFolderLabel,
         }),
       });
-      const data = await res.json();
+      const data = await readJsonSafe(res);
       if (!res.ok) {
         throw new Error(data.error || 'Batch anonymization failed');
       }

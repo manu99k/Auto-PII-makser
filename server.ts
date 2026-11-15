@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import express from 'express';
 import JSZip from 'jszip';
@@ -16,7 +17,12 @@ import type {
   UploadedFileSummary,
 } from './src/types.ts';
 
-const WORKSPACE_ROOT = '/tmp/redactbatch-workspace';
+const WORKSPACE_ROOT = path.join(os.tmpdir(), 'redactbatch-workspace');
+
+function isPathInside(baseDir: string, targetPath: string): boolean {
+  const rel = path.relative(path.resolve(baseDir), path.resolve(targetPath));
+  return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+}
 
 function safeWorkspaceId(raw: string): string {
   return raw.replace(/[^a-zA-Z0-9_-]/g, '') || 'default';
@@ -71,7 +77,8 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
     files: 1000,
-    fileSize: 25 * 1024 * 1024, // 25MB per PDF
+    fileSize: 250 * 1024 * 1024, // 250MB per PDF
+    fieldSize: 50 * 1024 * 1024, // Support large relativePaths metadata JSON
   },
 });
 
@@ -122,7 +129,20 @@ async function startServer() {
   });
 
   // Upload 1 to 1,000 PDFs or an entire folder
-  app.post('/api/workspace/upload', upload.array('files', 1000), async (req, res) => {
+  app.post('/api/workspace/upload', (req, res, next) => {
+    upload.array('files', 1000)(req, res, (err) => {
+      if (err) {
+        const message =
+          err instanceof multer.MulterError
+            ? `Upload limit error (${err.code}): ${err.message}`
+            : err instanceof Error
+            ? err.message
+            : 'Upload middleware failed';
+        return res.status(400).json({ error: message });
+      }
+      next();
+    });
+  }, async (req, res) => {
     try {
       const rawId =
         typeof req.body?.workspaceId === 'string' && req.body.workspaceId
@@ -284,7 +304,7 @@ async function startServer() {
       const baseDir = side === 'output' ? outputDir : inputDir;
       const target = path.resolve(baseDir, rel);
 
-      if (!target.startsWith(path.resolve(baseDir) + path.sep)) {
+      if (!isPathInside(baseDir, target)) {
         return res.status(403).json({ error: 'Invalid path' });
       }
 
@@ -305,7 +325,7 @@ async function startServer() {
       const { outputDir } = await ensureWorkspaceDirs(workspaceId);
       const target = path.resolve(outputDir, rel);
 
-      if (!target.startsWith(path.resolve(outputDir) + path.sep)) {
+      if (!isPathInside(outputDir, target)) {
         return res.status(403).json({ error: 'Invalid path' });
       }
 
@@ -427,6 +447,26 @@ python3 anonymize_pdfs.py \\
       });
     }
   });
+
+  // Ensure API errors and unmatched /api routes always return JSON instead of HTML
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ error: 'API endpoint not found' });
+  });
+
+  app.use(
+    (
+      err: unknown,
+      req: express.Request,
+      res: express.Response,
+      next: express.NextFunction
+    ) => {
+      if (req.path.startsWith('/api')) {
+        const message = err instanceof Error ? err.message : 'Internal server error';
+        return res.status(500).json({ error: message });
+      }
+      next(err);
+    }
+  );
 
   if (process.env.NODE_ENV === 'production') {
     const distDir = path.resolve(process.cwd(), 'dist');
