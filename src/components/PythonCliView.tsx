@@ -37,6 +37,7 @@ export function PythonCliView({
 
   const entitiesArg = config.entities.join(',') || 'PERSON,SIN,CANADIAN_BANK_ACCOUNT,ADDRESS,PHONE,EMAIL,CREDIT_CARD,LEGAL_CASE_ID';
   const consistentArg = config.consistentMapping ? ' \\\n  --consistent' : '';
+  const cibcArg = config.ignoreCibcEmployees === false ? ' \\\n  --no-ignore-cibc-employees' : ' \\\n  --ignore-cibc-employees';
   const cliCommand = `python3 anonymize_pdfs.py \\
   --input-dir "${inputFolderLabel || './input_pdfs'}" \\
   --output-dir "${outputFolderLabel || './anonymized_pdfs'}" \\
@@ -44,7 +45,7 @@ export function PythonCliView({
   --mode "${config.mode}" \\
   --entities "${entitiesArg}" \\
   --min-confidence ${config.minConfidence.toFixed(2)} \\
-  --seed ${config.seed}${consistentArg} \\
+  --seed ${config.seed}${consistentArg}${cibcArg} \\
   --workers 8`;
 
   const copyCommand = async () => {

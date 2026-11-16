@@ -22,15 +22,15 @@ import type {
 } from '../types';
 
 const ENTITY_OPTIONS: Array<{ id: PiiEntityType; label: string; example: string }> = [
-  { id: 'PERSON', label: 'Client / Party Names', example: 'Margaret E. Vance' },
-  { id: 'SIN', label: 'Canadian SIN (Luhn)', example: '482-910-338' },
-  { id: 'CANADIAN_BANK_ACCOUNT', label: 'Bank / LIRA / Transit', example: '00412-003-8901234' },
-  { id: 'ADDRESS', label: 'Canadian Address / Postal', example: 'Toronto, ON M5H 1J8' },
+  { id: 'PERSON', label: 'Client / Customer Names (EN/FR)', example: 'Ethan Thomas / Jean Tremblay' },
+  { id: 'SIN', label: 'Canadian SIN / NAS (Luhn)', example: '482-910-338' },
+  { id: 'CANADIAN_BANK_ACCOUNT', label: 'Bank / RRSP / TFSA / LIRA / RESP', example: '101134059-18 / REER' },
+  { id: 'ADDRESS', label: 'Canadian Address / Postal (EN/FR)', example: 'Montréal, QC H3B 4W8' },
   { id: 'PHONE', label: 'Canadian Phone', example: '(416) 892-3410' },
-  { id: 'EMAIL', label: 'Email Addresses', example: 'name@company.ca' },
+  { id: 'EMAIL', label: 'Customer Email Addresses', example: 'client@example.ca' },
   { id: 'CREDIT_CARD', label: 'Credit Cards (Luhn)', example: '4532-0151-...' },
-  { id: 'DOB', label: 'DOB / Marriage Dates', example: '1984-08-25' },
-  { id: 'LEGAL_CASE_ID', label: 'Court Docket / CRA BN', example: 'FS-24-0091842-0000' },
+  { id: 'DOB', label: 'DOB / Marriage Dates (EN/FR)', example: '1984-08-25 / 14 fév 1986' },
+  { id: 'LEGAL_CASE_ID', label: 'Court Docket / CRA / QESI', example: 'FS-24-0091842-0000' },
   { id: 'PASSPORT', label: 'Passport / Prov. DL', example: 'M4920-41829-20214' },
 ];
 
@@ -359,10 +359,29 @@ export function BatchWorkspaceView({
               />
               <div>
                 <span className="block text-xs font-medium text-slate-800">
-                  Scrub Underlying PDF Stream Strings
+                  Scrub Underlying PDF Stream Strings &amp; Links
                 </span>
                 <span className="block text-xs text-slate-500">
-                  Removes matched ASCII literals from content streams before saving.
+                  Removes matched literals, Form XObjects, and clickable mailto: links before saving.
+                </span>
+              </div>
+            </label>
+
+            <label className="flex items-start gap-2.5 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={config.ignoreCibcEmployees !== false}
+                onChange={(e) =>
+                  onConfigChange({ ...config, ignoreCibcEmployees: e.target.checked })
+                }
+                className="mt-0.5 rounded border-slate-300 text-blue-700 focus:ring-blue-600"
+              />
+              <div>
+                <span className="block text-xs font-medium text-slate-800">
+                  Ignore CIBC Employee &amp; Branch Contact PII
+                </span>
+                <span className="block text-xs text-slate-500">
+                  Preserves @cibc.com/@cibc.ca emails, CIBC staff names, and Branch Contact fields while redacting customer PII.
                 </span>
               </div>
             </label>

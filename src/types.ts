@@ -29,6 +29,7 @@ export interface BatchConfig {
   seed: number;
   customRules: CustomRule[];
   scrubStream: boolean;
+  ignoreCibcEmployees?: boolean;
 }
 
 export interface PiiOccurrence {

@@ -411,6 +411,7 @@ async function startServer() {
         : 'PERSON,SIN,CANADIAN_BANK_ACCOUNT,ADDRESS,PHONE,EMAIL,CREDIT_CARD,DOB,LEGAL_CASE_ID,PASSPORT';
       const minConfidence = Number(req.body?.minConfidence ?? 0.85).toFixed(2);
       const consistentFlag = req.body?.consistentMapping ? ' --consistent' : '';
+      const cibcFlag = req.body?.ignoreCibcEmployees === false ? ' --no-ignore-cibc-employees' : ' --ignore-cibc-employees';
       const seed = Number(req.body?.seed ?? 42);
       const inputDir = String(req.body?.inputFolderLabel || './input_pdfs');
       const outputDir = String(req.body?.outputFolderLabel || './anonymized_pdfs');
@@ -427,7 +428,7 @@ python3 anonymize_pdfs.py \\
   --mode "${mode}" \\
   --entities "${entities}" \\
   --min-confidence ${minConfidence} \\
-  --seed ${seed}${consistentFlag} \\
+  --seed ${seed}${consistentFlag}${cibcFlag} \\
   --workers 8
 `;
 

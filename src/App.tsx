@@ -31,6 +31,7 @@ const INITIAL_CONFIG: BatchConfig = {
   seed: 42,
   customRules: [],
   scrubStream: true,
+  ignoreCibcEmployees: true,
 };
 
 function generateWorkspaceId(): string {
@@ -231,6 +232,7 @@ export default function App() {
           entities: config.entities,
           minConfidence: config.minConfidence,
           consistentMapping: config.consistentMapping,
+          ignoreCibcEmployees: config.ignoreCibcEmployees,
           seed: config.seed,
           inputFolderLabel,
           outputFolderLabel,

@@ -3,9 +3,13 @@ import { pathToFileURL } from 'node:url';
 import zlib from 'node:zlib';
 import {
   PDFArray,
+  PDFDict,
   PDFDocument,
+  PDFHexString,
   PDFName,
+  PDFNumber,
   PDFRawStream,
+  PDFString,
   StandardFonts,
   rgb,
 } from 'pdf-lib';
@@ -17,6 +21,7 @@ import type {
 } from '../src/types.ts';
 import {
   detectPiiInText,
+  extractCibcContext,
   filterByConfidence,
   generateMockReplacement,
   type DetectedSpan,
@@ -88,7 +93,12 @@ export async function extractPdfPages(pdfBytes: Uint8Array): Promise<ExtractedPa
         if (fullText.length > 0) {
           if (prevY !== null && Math.abs(y - prevY) > fontSize * 0.65) {
             fullText += '\n';
-          } else if (prevEndX !== null && x - prevEndX > fontSize * 0.22 && !fullText.endsWith(' ') && !str.startsWith(' ')) {
+          } else if (
+            prevEndX !== null &&
+            x - prevEndX > fontSize * 0.22 &&
+            !fullText.endsWith(' ') &&
+            !str.startsWith(' ')
+          ) {
             fullText += ' ';
           }
         }
@@ -105,6 +115,42 @@ export async function extractPdfPages(pdfBytes: Uint8Array): Promise<ExtractedPa
 
         prevY = y;
         prevEndX = x + width;
+      }
+
+      // Include any unflattened AcroForm Widget annotation text values (only present if flattening failed)
+      try {
+        const annots = await page.getAnnotations();
+        for (const annot of annots) {
+          if (
+            annot &&
+            annot.subtype === 'Widget' &&
+            typeof annot.fieldValue === 'string' &&
+            annot.fieldValue.trim().length > 0 &&
+            Array.isArray(annot.rect) &&
+            annot.rect.length === 4
+          ) {
+            const val = annot.fieldValue.trim();
+            const [rx1, ry1, rx2, ry2] = annot.rect as number[];
+            const boxW = Math.max(12, Math.abs(rx2 - rx1));
+            const boxH = Math.max(10, Math.abs(ry2 - ry1));
+            const fontSize = Math.max(7, Math.min(12, boxH * 0.65));
+            const x = Math.min(rx1, rx2) + 2;
+            const y = Math.min(ry1, ry2) + Math.max(2, (boxH - fontSize) * 0.35);
+
+            if (fullText.length > 0) fullText += '\n';
+            const startOffset = fullText.length;
+            fullText += val;
+            const endOffset = fullText.length;
+
+            mappedItems.push({
+              box: { str: val, x, y, width: boxW, height: boxH, fontSize },
+              startOffset,
+              endOffset,
+            });
+          }
+        }
+      } catch {
+        // Ignore annotation extraction errors on exotic PDFs
       }
 
       pages.push({
@@ -151,24 +197,108 @@ function computeSpanBoundingBox(
     const subX0 = box.x + box.width * startRatio;
     const subX1 = box.x + box.width * endRatio;
 
-    minX = Math.min(minX, subX0);
-    maxX = Math.max(maxX, subX1);
-    minY = Math.min(minY, box.y - box.fontSize * 0.22);
-    maxY = Math.max(maxY, box.y + box.fontSize * 0.92);
+    minX = Math.min(minX, subX0 - 1.5);
+    maxX = Math.max(maxX, subX1 + 2.0);
+    minY = Math.min(minY, box.y - box.fontSize * 0.35);
+    maxY = Math.max(maxY, box.y + box.fontSize * 1.08);
     avgFont += box.fontSize;
   }
 
   return {
     x: minX,
     y: minY,
-    width: Math.max(12, maxX - minX),
-    height: Math.max(10, maxY - minY),
+    width: Math.max(14, maxX - minX),
+    height: Math.max(11, maxY - minY),
     fontSize: avgFont / overlapping.length,
   };
 }
 
 function escapePdfLiteralRegex(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function scrubTjKerningArrays(
+  contentStr: string,
+  targets: string[]
+): { content: string; modified: boolean } {
+  let modified = false;
+  const tjBlockRe = /\[([^\]]{1,8000})\]\s*TJ/g;
+
+  const updated = contentStr.replace(tjBlockRe, (fullMatch, inner: string) => {
+    const segRe = /\(((?:\\.|[^\\()])*)\)/g;
+    const segments: Array<{
+      rawStart: number;
+      rawEnd: number;
+      decoded: string;
+      joinedStart: number;
+      joinedEnd: number;
+    }> = [];
+
+    let joined = '';
+    let sm: RegExpExecArray | null;
+    while ((sm = segRe.exec(inner)) !== null) {
+      const decoded = sm[1]
+        .replace(/\\([()\\])/g, '$1')
+        .replace(/\\r/g, '\r')
+        .replace(/\\n/g, '\n')
+        .replace(/\\t/g, '\t');
+      const joinedStart = joined.length;
+      joined += decoded;
+      const joinedEnd = joined.length;
+      segments.push({
+        rawStart: sm.index + 1,
+        rawEnd: sm.index + 1 + sm[1].length,
+        decoded,
+        joinedStart,
+        joinedEnd,
+      });
+    }
+
+    if (segments.length === 0 || joined.length < 3) return fullMatch;
+
+    const blankMask = new Array<boolean>(joined.length).fill(false);
+    let blockHit = false;
+
+    for (const orig of targets) {
+      if (orig.length < 3) continue;
+      let searchFrom = 0;
+      const lowerJoined = joined.toLowerCase();
+      const lowerOrig = orig.toLowerCase();
+      while (searchFrom < lowerJoined.length) {
+        const idx = lowerJoined.indexOf(lowerOrig, searchFrom);
+        if (idx === -1) break;
+        for (let k = idx; k < idx + orig.length; k++) {
+          blankMask[k] = true;
+        }
+        blockHit = true;
+        searchFrom = idx + orig.length;
+      }
+    }
+
+    if (!blockHit) return fullMatch;
+
+    modified = true;
+    let rebuilt = '';
+    let innerCursor = 0;
+    for (const seg of segments) {
+      rebuilt += inner.slice(innerCursor, seg.rawStart);
+      let segOut = '';
+      for (let i = 0; i < seg.decoded.length; i++) {
+        const ch = blankMask[seg.joinedStart + i] ? ' ' : seg.decoded[i];
+        if (ch === '(' || ch === ')' || ch === '\\') {
+          segOut += `\\${ch}`;
+        } else {
+          segOut += ch;
+        }
+      }
+      rebuilt += segOut;
+      innerCursor = seg.rawEnd;
+    }
+    rebuilt += inner.slice(innerCursor);
+    return `[${rebuilt}] TJ`;
+  });
+
+  return { content: updated, modified };
 }
 
 function scrubStreamStrings(
@@ -178,70 +308,408 @@ function scrubStreamStrings(
   if (replacements.length === 0) return;
   // Sort longest first so partial substrings don't clobber longer matches
   const sorted = [...replacements].sort((a, b) => b.original.length - a.original.length);
+  const uniqueOriginals = Array.from(new Set(sorted.map((r) => r.original))).filter(
+    (s) => s.length >= 3
+  );
+  if (uniqueOriginals.length === 0) return;
 
-  for (const page of pdfDoc.getPages()) {
-    const contentsRef = page.node.get(PDFName.of('Contents'));
-    if (!contentsRef) continue;
-
-    const refs: unknown[] = [];
-    const lookedUp = pdfDoc.context.lookup(contentsRef);
-    if (lookedUp instanceof PDFArray) {
-      for (let i = 0; i < lookedUp.size(); i++) {
-        refs.push(pdfDoc.context.lookup(lookedUp.get(i)));
+  for (const [, obj] of pdfDoc.context.enumerateIndirectObjects()) {
+    if (!(obj instanceof PDFRawStream)) continue;
+    try {
+      const subtype = obj.dict.get(PDFName.of('Subtype'));
+      const subtypeStr = subtype instanceof PDFName ? subtype.asString() : '';
+      if (
+        subtypeStr === '/Image' ||
+        subtypeStr === '/Type1C' ||
+        subtypeStr === '/CIDFontType0C' ||
+        subtypeStr === '/OpenType'
+      ) {
+        continue;
       }
-    } else {
-      refs.push(lookedUp);
-    }
+      const typeName = obj.dict.get(PDFName.of('Type'));
+      const typeStr = typeName instanceof PDFName ? typeName.asString() : '';
+      if (typeStr === '/XRef' || typeStr === '/ObjStm') continue;
+      if (obj.dict.has(PDFName.of('Length1'))) continue;
 
-    for (const streamObj of refs) {
-      if (!(streamObj instanceof PDFRawStream)) continue;
-      try {
-        const filter = streamObj.dict.get(PDFName.of('Filter'));
-        const isFlate =
-          filter instanceof PDFName && filter.asString() === '/FlateDecode';
-        const rawBytes = isFlate
-          ? zlib.inflateSync(streamObj.contents)
-          : Buffer.from(streamObj.contents);
+      const filter = obj.dict.get(PDFName.of('Filter'));
+      let isFlate = false;
+      if (!filter) {
+        isFlate = false;
+      } else if (filter instanceof PDFName && filter.asString() === '/FlateDecode') {
+        isFlate = true;
+      } else if (
+        filter instanceof PDFArray &&
+        filter.size() === 1 &&
+        filter.get(0) instanceof PDFName &&
+        (filter.get(0) as PDFName).asString() === '/FlateDecode'
+      ) {
+        isFlate = true;
+      } else {
+        continue; // Skip DCTDecode/JPXDecode/unsupported binary filters
+      }
 
-        let contentStr = rawBytes.toString('latin1');
-        let modified = false;
+      const rawBytes = isFlate ? zlib.inflateSync(obj.contents) : Buffer.from(obj.contents);
+      let contentStr = rawBytes.toString('latin1');
+      let modified = false;
 
-        for (const { original } of sorted) {
-          if (original.length < 3) continue;
-          const escaped = escapePdfLiteralRegex(original);
-          const re = new RegExp(escaped, 'g');
-          if (re.test(contentStr)) {
-            // Replace original characters inside PDF literal operators with spaces
-            const blank = ' '.repeat(original.length);
-            contentStr = contentStr.replace(re, blank);
-            modified = true;
-          }
+      for (const original of uniqueOriginals) {
+        // 1. Direct PDF literal string match (ASCII / escaped parens)
+        const escaped = escapePdfLiteralRegex(original);
+        const re = new RegExp(escaped, 'g');
+        if (re.test(contentStr)) {
+          contentStr = contentStr.replace(re, ' '.repeat(original.length));
+          modified = true;
+        }
 
-          // Also match hex-encoded WinAnsi/ASCII strings (<4A6F686E...>) used by pdf-lib & many generators
-          const hexTarget = Buffer.from(original, 'latin1').toString('hex').toUpperCase();
-          const hexRe = new RegExp(hexTarget, 'gi');
-          if (hexRe.test(contentStr)) {
-            const hexBlank = '20'.repeat(original.length);
-            contentStr = contentStr.replace(hexRe, hexBlank);
+        // Also match PDF-escaped parens inside literal strings e.g. \(416\) 892-3410
+        const pdfEscaped = original
+          .replace(/\\/g, '\\\\')
+          .replace(/\(/g, '\\(')
+          .replace(/\)/g, '\\)');
+        if (pdfEscaped !== original) {
+          const pdfEscRe = new RegExp(escapePdfLiteralRegex(pdfEscaped), 'g');
+          if (pdfEscRe.test(contentStr)) {
+            contentStr = contentStr.replace(pdfEscRe, ' '.repeat(original.length));
             modified = true;
           }
         }
 
-        if (modified) {
-          const updatedBuf = Buffer.from(contentStr, 'latin1');
-          const finalBytes = isFlate ? zlib.deflateSync(updatedBuf) : updatedBuf;
-          // Mutate raw stream contents and Length entry
-          (streamObj as unknown as { contents: Uint8Array }).contents = new Uint8Array(finalBytes);
-          streamObj.dict.set(
-            PDFName.of('Length'),
-            pdfDoc.context.obj(finalBytes.length)
-          );
+        // 2. Hex-encoded WinAnsi/ASCII strings (<4A6F686E...>) used by pdf-lib & PDF writers
+        const hexTarget = Buffer.from(original, 'latin1').toString('hex').toUpperCase();
+        const hexRe = new RegExp(hexTarget, 'gi');
+        if (hexRe.test(contentStr)) {
+          contentStr = contentStr.replace(hexRe, '20'.repeat(original.length));
+          modified = true;
+        }
+      }
+
+      // 3. Split-kerning TJ array strings: [(da) -12 (vid@ex) 8 (ample.ca)] TJ
+      const tjResult = scrubTjKerningArrays(contentStr, uniqueOriginals);
+      if (tjResult.modified) {
+        contentStr = tjResult.content;
+        modified = true;
+      }
+
+      if (modified) {
+        const updatedBuf = Buffer.from(contentStr, 'latin1');
+        const finalBytes = isFlate ? zlib.deflateSync(updatedBuf) : updatedBuf;
+        (obj as unknown as { contents: Uint8Array }).contents = new Uint8Array(finalBytes);
+        obj.dict.set(PDFName.of('Length'), pdfDoc.context.obj(finalBytes.length));
+      }
+    } catch {
+      // Skip streams that fail inflation cleanly
+    }
+  }
+}
+
+function decodePdfStringValue(val: unknown): string {
+  if (val instanceof PDFString) return val.decodeText();
+  if (val instanceof PDFHexString) return val.decodeText();
+  return '';
+}
+
+function rectsOverlap(
+  a: [number, number, number, number],
+  b: { x: number; y: number; width: number; height: number },
+  pad = 4
+): boolean {
+  const ax1 = Math.min(a[0], a[2]);
+  const ay1 = Math.min(a[1], a[3]);
+  const ax2 = Math.max(a[0], a[2]);
+  const ay2 = Math.max(a[1], a[3]);
+
+  const bx1 = b.x - pad;
+  const by1 = b.y - pad;
+  const bx2 = b.x + b.width + pad;
+  const by2 = b.y + b.height + pad;
+
+  return ax1 < bx2 && ax2 > bx1 && ay1 < by2 && ay2 > by1;
+}
+
+function readRectTuple(pdfDoc: PDFDocument, dict: PDFDict): [number, number, number, number] | null {
+  const rawRect = dict.get(PDFName.of('Rect'));
+  const rectArr = pdfDoc.context.lookup(rawRect);
+  if (!(rectArr instanceof PDFArray) || rectArr.size() < 4) return null;
+  const nums: number[] = [];
+  for (let i = 0; i < 4; i++) {
+    const item = pdfDoc.context.lookup(rectArr.get(i));
+    if (!(item instanceof PDFNumber)) return null;
+    nums.push(item.asNumber());
+  }
+  return [nums[0], nums[1], nums[2], nums[3]];
+}
+
+function scrubAnnotationsAndLinks(
+  pdfDoc: PDFDocument,
+  extractedPages: ExtractedPage[],
+  pagePlans: Map<number, PageRedactionPlan[]>,
+  allRedactedStrings: string[]
+) {
+  const lowerTargets = allRedactedStrings
+    .filter((s) => s.length >= 3)
+    .map((s) => s.toLowerCase());
+
+  const pdfPages = pdfDoc.getPages();
+  for (let idx = 0; idx < pdfPages.length; idx++) {
+    const pdfPage = pdfPages[idx];
+    const pageNum = extractedPages[idx]?.pageNumber ?? idx + 1;
+    const plans = pagePlans.get(pageNum) ?? [];
+
+    const annotsRef = pdfPage.node.get(PDFName.of('Annots'));
+    if (!annotsRef) continue;
+    const annotsObj = pdfDoc.context.lookup(annotsRef);
+    if (!(annotsObj instanceof PDFArray)) continue;
+
+    for (let i = annotsObj.size() - 1; i >= 0; i--) {
+      try {
+        const annot = pdfDoc.context.lookup(annotsObj.get(i));
+        if (!(annot instanceof PDFDict)) continue;
+
+        const subtype = annot.get(PDFName.of('Subtype'));
+        const subtypeStr = subtype instanceof PDFName ? subtype.asString() : '';
+        const rect = readRectTuple(pdfDoc, annot);
+        const overlapsRedaction =
+          rect !== null && plans.some((p) => rectsOverlap(rect, p.bbox, 6));
+
+        let matchesUriOrText = false;
+        if (subtypeStr === '/Link') {
+          const action = pdfDoc.context.lookup(annot.get(PDFName.of('A')));
+          if (action instanceof PDFDict) {
+            const uri = decodePdfStringValue(pdfDoc.context.lookup(action.get(PDFName.of('URI'))));
+            const lowerUri = uri.toLowerCase();
+            if (lowerUri && lowerTargets.some((t) => lowerUri.includes(t))) {
+              matchesUriOrText = true;
+            }
+          }
+          const contents = decodePdfStringValue(pdfDoc.context.lookup(annot.get(PDFName.of('Contents'))));
+          if (contents && lowerTargets.some((t) => contents.toLowerCase().includes(t))) {
+            matchesUriOrText = true;
+          }
+          if (overlapsRedaction || matchesUriOrText) {
+            annotsObj.remove(i);
+          }
+        } else if (subtypeStr === '/Widget') {
+          const val = decodePdfStringValue(pdfDoc.context.lookup(annot.get(PDFName.of('V'))));
+          const dv = decodePdfStringValue(pdfDoc.context.lookup(annot.get(PDFName.of('DV'))));
+          const combined = `${val}\n${dv}`.toLowerCase();
+          if (
+            overlapsRedaction ||
+            (combined.trim() && lowerTargets.some((t) => combined.includes(t)))
+          ) {
+            annotsObj.remove(i);
+          }
+        } else if (overlapsRedaction) {
+          // Remove any popup/text/markup annotation sitting over a redacted area
+          annotsObj.remove(i);
         }
       } catch {
-        // Skip streams with unsupported filters safely
+        // Continue inspecting remaining annotations safely
       }
     }
   }
+}
+
+function scrubPdfMetadata(pdfDoc: PDFDocument, allRedactedStrings: string[]) {
+  const targets = allRedactedStrings.filter((s) => s.length >= 4);
+  if (targets.length === 0) return;
+
+  const scrubVal = (val: string | undefined): string | undefined => {
+    if (!val) return val;
+    let out = val;
+    for (const t of targets) {
+      const re = new RegExp(escapePdfLiteralRegex(t), 'gi');
+      if (re.test(out)) {
+        out = out.replace(re, '[REDACTED]');
+      }
+    }
+    return out;
+  };
+
+  try {
+    const title = scrubVal(pdfDoc.getTitle());
+    if (title !== undefined) pdfDoc.setTitle(title);
+    const author = scrubVal(pdfDoc.getAuthor());
+    if (author !== undefined) pdfDoc.setAuthor(author);
+    const subject = scrubVal(pdfDoc.getSubject());
+    if (subject !== undefined) pdfDoc.setSubject(subject);
+  } catch {
+    // Ignore metadata read/write errors on malformed Info dicts
+  }
+}
+
+function toWinAnsiSafe(text: string): string {
+  const normalized = text
+    .replace(/[\u00A0\u2007\u202F]/g, ' ')
+    .replace(/[\u2010-\u2015\u2212]/g, '-')
+    .replace(/[\u2018\u2019\u201A\u2039\u203A]/g, "'")
+    .replace(/[\u201C\u201D\u201E\u00AB\u00BB]/g, '"')
+    .replace(/\u2022/g, '*')
+    .replace(/\u2026/g, '...');
+
+  let out = '';
+  for (const ch of normalized) {
+    const code = ch.charCodeAt(0);
+    if ((code >= 0x20 && code <= 0x7e) || (code >= 0xa0 && code <= 0xff)) {
+      out += ch;
+    } else {
+      const ascii = ch.normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
+      for (const sub of ascii) {
+        const sc = sub.charCodeAt(0);
+        if ((sc >= 0x20 && sc <= 0x7e) || (sc >= 0xa0 && sc <= 0xff)) {
+          out += sub;
+        } else {
+          out += ' ';
+        }
+      }
+    }
+  }
+  return out;
+}
+
+interface PageRedactionPlan {
+  spanStart: number;
+  spanEnd: number;
+  replacement: string;
+  bbox: { x: number; y: number; width: number; height: number; fontSize: number };
+}
+
+function drawRedactionOverlay(
+  pdfPage: ReturnType<PDFDocument['getPages']>[number],
+  bbox: PageRedactionPlan['bbox'],
+  replacement: string,
+  mode: BatchConfig['mode'],
+  helvetica: Awaited<ReturnType<PDFDocument['embedFont']>>,
+  courier: Awaited<ReturnType<PDFDocument['embedFont']>>
+) {
+  const safeReplacement = toWinAnsiSafe(replacement) || '[MASKED]';
+  const drawFont = mode === 'solid_mask' ? courier : helvetica;
+  const baseFontSize = Math.max(7, Math.min(bbox.fontSize, 14));
+  let drawSize = baseFontSize;
+  const textWidth = drawFont.widthOfTextAtSize(safeReplacement, drawSize);
+  const pageWidth = pdfPage.getWidth();
+  const maxAvailWidth = Math.max(40, pageWidth - bbox.x - 14);
+  const targetBoxWidth = Math.max(bbox.width + 6, Math.min(textWidth + 8, maxAvailWidth));
+
+  // Scale down slightly if replacement text is wider than available horizontal room
+  while (drawSize > 6.2 && drawFont.widthOfTextAtSize(safeReplacement, drawSize) > targetBoxWidth - 4) {
+    drawSize -= 0.4;
+  }
+
+  const boxX = Math.max(4, bbox.x - 1.5);
+  const boxY = Math.max(4, bbox.y - 1.5);
+  const boxH = Math.max(bbox.height + 3, drawSize + 5);
+
+  if (mode === 'solid_mask') {
+    pdfPage.drawRectangle({
+      x: boxX,
+      y: boxY,
+      width: targetBoxWidth,
+      height: boxH,
+      color: rgb(0.06, 0.09, 0.16),
+    });
+    pdfPage.drawText(safeReplacement, {
+      x: boxX + 3,
+      y: boxY + Math.max(2.5, (boxH - drawSize) * 0.35),
+      size: Math.min(drawSize, 9.5),
+      font: courier,
+      color: rgb(0.97, 0.98, 0.99),
+    });
+  } else if (mode === 'mask_and_replace') {
+    // Crisp light-slate masked field with hairline border + mock PII replacement
+    pdfPage.drawRectangle({
+      x: boxX,
+      y: boxY,
+      width: targetBoxWidth,
+      height: boxH,
+      color: rgb(0.94, 0.96, 0.99),
+      borderColor: rgb(0.68, 0.76, 0.88),
+      borderWidth: 0.6,
+    });
+    pdfPage.drawText(safeReplacement, {
+      x: boxX + 3,
+      y: boxY + Math.max(2.5, (boxH - drawSize) * 0.35),
+      size: drawSize,
+      font: helvetica,
+      color: rgb(0.06, 0.09, 0.16),
+    });
+  } else {
+    // whiteout_replace: clean whiteout mask + seamless mock replacement
+    pdfPage.drawRectangle({
+      x: boxX,
+      y: boxY,
+      width: targetBoxWidth,
+      height: boxH,
+      color: rgb(1, 1, 1),
+    });
+    pdfPage.drawText(safeReplacement, {
+      x: boxX + 1.5,
+      y: boxY + Math.max(2.5, (boxH - drawSize) * 0.35),
+      size: drawSize,
+      font: helvetica,
+      color: rgb(0.06, 0.09, 0.16),
+    });
+  }
+}
+
+async function buildReconstructedAnonymizedPdf(
+  extractedPages: ExtractedPage[],
+  pagePlans: Map<number, PageRedactionPlan[]>,
+  mode: BatchConfig['mode']
+): Promise<Uint8Array> {
+  const cleanDoc = await PDFDocument.create();
+  const helvetica = await cleanDoc.embedFont(StandardFonts.Helvetica);
+  const courier = await cleanDoc.embedFont(StandardFonts.Courier);
+
+  for (const pageData of extractedPages) {
+    const width = Math.max(200, pageData.width || 612);
+    const height = Math.max(200, pageData.height || 792);
+    const page = cleanDoc.addPage([width, height]);
+    const plans = pagePlans.get(pageData.pageNumber) ?? [];
+
+    page.drawRectangle({
+      x: 0,
+      y: 0,
+      width,
+      height,
+      color: rgb(1, 1, 1),
+    });
+
+    for (const item of pageData.items) {
+      const overlapping = plans.filter(
+        (p) => item.endOffset > p.spanStart && item.startOffset < p.spanEnd
+      );
+
+      let drawStr = item.box.str;
+      if (overlapping.length > 0) {
+        const chars = drawStr.split('');
+        for (const p of overlapping) {
+          const localStart = Math.max(0, p.spanStart - item.startOffset);
+          const localEnd = Math.min(chars.length, p.spanEnd - item.startOffset);
+          for (let i = localStart; i < localEnd; i++) {
+            chars[i] = ' ';
+          }
+        }
+        drawStr = chars.join('');
+      }
+
+      const safeText = toWinAnsiSafe(drawStr);
+      if (safeText.trim().length > 0) {
+        page.drawText(safeText, {
+          x: item.box.x,
+          y: item.box.y,
+          size: Math.max(5.5, Math.min(item.box.fontSize, 28)),
+          font: helvetica,
+          color: rgb(0.09, 0.12, 0.18),
+        });
+      }
+    }
+
+    for (const plan of plans) {
+      drawRedactionOverlay(page, plan.bbox, plan.replacement, mode, helvetica, courier);
+    }
+  }
+
+  return cleanDoc.save();
 }
 
 export async function anonymizePdfBuffer(
@@ -255,29 +723,56 @@ export async function anonymizePdfBuffer(
   const occurrences: PiiOccurrence[] = [];
 
   try {
-    const extractedPages = await extractPdfPages(inputBuffer);
-    const pdfDoc = await PDFDocument.load(inputBuffer, { ignoreEncryption: true });
-    const helvetica = await pdfDoc.embedFont(StandardFonts.Helvetica);
-    const courier = await pdfDoc.embedFont(StandardFonts.Courier);
-    const pdfPages = pdfDoc.getPages();
+    // Flatten interactive AcroForm fields FIRST so pdfjs-dist extracts all filled form values
+    // and redactions draw on top of flattened text instead of underneath Widget annotations
+    let workingBuffer = inputBuffer;
+    let preLoadedDoc: PDFDocument | null = null;
+    try {
+      const candidateDoc = await PDFDocument.load(inputBuffer, {
+        ignoreEncryption: true,
+        updateMetadata: false,
+      });
+      const form = candidateDoc.getForm();
+      if (form.getFields().length > 0) {
+        form.flatten();
+        workingBuffer = await candidateDoc.save();
+        preLoadedDoc = await PDFDocument.load(workingBuffer, {
+          ignoreEncryption: true,
+          updateMetadata: false,
+        });
+      } else {
+        preLoadedDoc = candidateDoc;
+      }
+    } catch {
+      preLoadedDoc = null;
+      workingBuffer = inputBuffer;
+    }
 
+    const extractedPages = await extractPdfPages(workingBuffer);
     const originalTexts: string[] = [];
     const streamScrubList: Array<{ original: string; replacement: string }> = [];
+    const pagePlans = new Map<number, PageRedactionPlan[]>();
     let nonce = 0;
     let skippedBelowThreshold = 0;
     const minConfidence =
       typeof config.minConfidence === 'number' ? config.minConfidence : 0.85;
+    const ignoreCibcEmployees = config.ignoreCibcEmployees !== false;
+    const docCibcEmployeeKeys = new Set<string>();
+    if (ignoreCibcEmployees) {
+      for (const pageData of extractedPages) {
+        const { cibcEmployeeNameKeys } = extractCibcContext(pageData.text);
+        for (const k of cibcEmployeeNameKeys) docCibcEmployeeKeys.add(k);
+      }
+    }
 
     for (let idx = 0; idx < extractedPages.length; idx++) {
       const pageData = extractedPages[idx];
-      const pdfPage = pdfPages[idx];
-      if (!pdfPage) continue;
-
       originalTexts.push(`--- Page ${pageData.pageNumber} ---\n${pageData.text}`);
       const rawSpans: DetectedSpan[] = detectPiiInText(
         pageData.text,
         config.entities,
-        config.customRules
+        config.customRules,
+        { ignoreCibcEmployees, extraIgnoredPersonKeys: docCibcEmployeeKeys }
       );
       const { accepted: spans, skippedCount } = filterByConfidence(
         rawSpans,
@@ -285,6 +780,7 @@ export async function anonymizePdfBuffer(
       );
       skippedBelowThreshold += skippedCount;
 
+      const plansForPage: PageRedactionPlan[] = [];
       for (const span of spans) {
         nonce++;
         const replacement = generateMockReplacement(
@@ -317,91 +813,84 @@ export async function anonymizePdfBuffer(
           },
         });
 
-        const drawFont = config.mode === 'solid_mask' ? courier : helvetica;
-        const baseFontSize = Math.max(7, Math.min(bbox.fontSize, 14));
-        let drawSize = baseFontSize;
-        const textWidth = drawFont.widthOfTextAtSize(replacement, drawSize);
-        const targetBoxWidth = Math.max(bbox.width + 4, Math.min(textWidth + 8, pdfPage.getWidth() - bbox.x - 18));
+        plansForPage.push({
+          spanStart: span.start,
+          spanEnd: span.end,
+          replacement,
+          bbox,
+        });
+      }
+      pagePlans.set(pageData.pageNumber, plansForPage);
+    }
 
-        // Scale down slightly if replacement text is wider than available horizontal room
-        while (drawSize > 6.2 && drawFont.widthOfTextAtSize(replacement, drawSize) > targetBoxWidth - 4) {
-          drawSize -= 0.4;
-        }
+    const allRedactedOriginals = occurrences.map((o) => o.original);
+    let outputBytes: Uint8Array;
+    try {
+      const pdfDoc =
+        preLoadedDoc ??
+        (await PDFDocument.load(workingBuffer, {
+          ignoreEncryption: true,
+          updateMetadata: false,
+        }));
 
-        const boxX = Math.max(8, bbox.x - 1.5);
-        const boxY = Math.max(8, bbox.y - 1);
-        const boxH = Math.max(bbox.height + 2, drawSize + 4);
+      const helvetica = await pdfDoc.embedFont(StandardFonts.Helvetica);
+      const courier = await pdfDoc.embedFont(StandardFonts.Courier);
+      const pdfPages = pdfDoc.getPages();
 
-        if (config.mode === 'solid_mask') {
-          pdfPage.drawRectangle({
-            x: boxX,
-            y: boxY,
-            width: targetBoxWidth,
-            height: boxH,
-            color: rgb(0.06, 0.09, 0.16),
-          });
-          pdfPage.drawText(replacement, {
-            x: boxX + 3,
-            y: boxY + Math.max(2.5, (boxH - drawSize) * 0.35),
-            size: Math.min(drawSize, 9.5),
-            font: courier,
-            color: rgb(0.97, 0.98, 0.99),
-          });
-        } else if (config.mode === 'mask_and_replace') {
-          // Crisp light-slate masked field with hairline border + mock PII replacement
-          pdfPage.drawRectangle({
-            x: boxX,
-            y: boxY,
-            width: targetBoxWidth,
-            height: boxH,
-            color: rgb(0.94, 0.96, 0.99),
-            borderColor: rgb(0.68, 0.76, 0.88),
-            borderWidth: 0.6,
-          });
-          pdfPage.drawText(replacement, {
-            x: boxX + 3,
-            y: boxY + Math.max(2.5, (boxH - drawSize) * 0.35),
-            size: drawSize,
-            font: helvetica,
-            color: rgb(0.06, 0.09, 0.16),
-          });
-        } else {
-          // whiteout_replace: clean whiteout mask + seamless mock replacement
-          pdfPage.drawRectangle({
-            x: boxX,
-            y: boxY,
-            width: targetBoxWidth,
-            height: boxH,
-            color: rgb(1, 1, 1),
-          });
-          pdfPage.drawText(replacement, {
-            x: boxX + 1,
-            y: boxY + Math.max(2.5, (boxH - drawSize) * 0.35),
-            size: drawSize,
-            font: helvetica,
-            color: rgb(0.06, 0.09, 0.16),
-          });
+      // Remove clickable mailto:/URI link annotations & widgets under redacted PII
+      scrubAnnotationsAndLinks(pdfDoc, extractedPages, pagePlans, allRedactedOriginals);
+
+      for (let idx = 0; idx < extractedPages.length; idx++) {
+        const pageData = extractedPages[idx];
+        const pdfPage = pdfPages[idx];
+        if (!pdfPage) continue;
+        const plans = pagePlans.get(pageData.pageNumber) ?? [];
+        for (const plan of plans) {
+          drawRedactionOverlay(pdfPage, plan.bbox, plan.replacement, config.mode, helvetica, courier);
         }
       }
-    }
 
-    if (config.scrubStream) {
-      scrubStreamStrings(pdfDoc, streamScrubList);
-    }
+      if (config.scrubStream) {
+        scrubStreamStrings(pdfDoc, streamScrubList);
+        scrubPdfMetadata(pdfDoc, allRedactedOriginals);
+      }
 
-    const outputBytes = await pdfDoc.save();
+      outputBytes = await pdfDoc.save();
+    } catch {
+      // Fallback for malformed PDFs (e.g. broken PDFDict/indirect refs) that pdfjs-dist parsed cleanly
+      outputBytes = await buildReconstructedAnonymizedPdf(
+        extractedPages,
+        pagePlans,
+        config.mode
+      );
+    }
 
     // Verify anonymized output text via pdfjs re-extraction
-    const postPages = await extractPdfPages(outputBytes);
+    let postPages = await extractPdfPages(outputBytes);
+    let fullPostText = postPages.map((p) => p.text).join('\n');
+    let leaked = occurrences.some(
+      (occ) => occ.original.length >= 4 && fullPostText.includes(occ.original)
+    );
+
+    // If underlying CID/Identity-H/compressed objects still leaked original PII text,
+    // rebuild clean stream-scrubbed pages so 0% original PII remains recoverable
+    if (config.scrubStream && leaked) {
+      outputBytes = await buildReconstructedAnonymizedPdf(
+        extractedPages,
+        pagePlans,
+        config.mode
+      );
+      postPages = await extractPdfPages(outputBytes);
+      fullPostText = postPages.map((p) => p.text).join('\n');
+      leaked = occurrences.some(
+        (occ) => occ.original.length >= 4 && fullPostText.includes(occ.original)
+      );
+    }
+
     const anonymizedTextPreview = postPages
       .map((p) => `--- Page ${p.pageNumber} ---\n${p.text}`)
       .join('\n\n')
       .slice(0, 6000);
-
-    const fullPostText = postPages.map((p) => p.text).join('\n');
-    const leaked = occurrences.some(
-      (occ) => occ.original.length >= 4 && fullPostText.includes(occ.original)
-    );
 
     const elapsedMs = Math.round(performance.now() - t0);
     return {
@@ -577,30 +1066,30 @@ const SAMPLE_TEMPLATES: SampleDocTemplate[] = [
     ],
   },
   {
-    filename: 'cra_notice_of_assessment_2025.pdf',
-    folder: 'tax',
-    title: 'CANADA REVENUE AGENCY — NOTICE OF ASSESSMENT (2025)',
-    subtitle: 'T1 Individual Income Tax Return · RRSP & TFSA Deduction Limit',
+    filename: 'quebec_reee_transfert_iqee_tp1029.pdf',
+    folder: 'french',
+    title: 'FORMULAIRE TP-1029.8.R2-V — TRANSFERT REEE / IQEE (QUÉBEC)',
+    subtitle: 'Incitatif québécois à l’épargne-études · Services Investisseurs CIBC',
     sections: [
       {
-        heading: 'Taxpayer Identification',
+        heading: 'Coordonnées de la succursale (CIBC)',
         lines: [
-          'Taxpayer: Jonathan P. Mercer',
-          'SIN: 482-910-338',
-          'DOB: 1992-02-14',
-          'Address: 1250 Boulevard René-Lévesque Ouest, Montreal, QC H3B 4W8',
-          'Phone: (514) 338-4501',
-          'Email: j.mercer@laurentian.ca',
+          'Conseiller CIBC: David Goldstein',
+          'Courriel: david.goldstein@cibc.com',
+          'Transit: 07012',
         ],
       },
       {
-        heading: 'Assessment Reference & Registered Accounts',
+        heading: 'Renseignements sur le client et le régime',
         lines: [
-          'CRA Ref No.: CRA-2025-8841209',
-          'Ontario DL: M4920-41829-20214',
-          'RRSP Account #: RRSP-66201944',
-          'Passport: GA884120',
-          'Prepared for: Jonathan P. Mercer',
+          'Nom du client: Jean-François Tremblay',
+          'NAS: 482-910-338',
+          'Date de naissance: 14 février 1986',
+          'Adresse: 1250 Boulevard René-Lévesque Ouest, Montréal, QC H3B 4W8',
+          'Téléphone: (514) 338-4501',
+          'Courriel: jf.tremblay@laurentian.ca',
+          'Numéro de régime REEE: 101134059-18',
+          'Numéro de compte: 654321',
         ],
       },
     ],
@@ -634,14 +1123,14 @@ export async function generateSamplePdfBatch(count = 5): Promise<
       borderColor: rgb(0.84, 0.87, 0.92),
       borderWidth: 0.75,
     });
-    page.drawText(tpl.title, {
+    page.drawText(toWinAnsiSafe(tpl.title), {
       x: 62,
       y: 726,
       size: 13,
       font: fontBold,
       color: rgb(0.06, 0.09, 0.16),
     });
-    page.drawText(tpl.subtitle, {
+    page.drawText(toWinAnsiSafe(tpl.subtitle), {
       x: 62,
       y: 709,
       size: 9.5,
@@ -651,7 +1140,7 @@ export async function generateSamplePdfBatch(count = 5): Promise<
 
     let cursorY = 656;
     for (const section of tpl.sections) {
-      page.drawText(section.heading, {
+      page.drawText(toWinAnsiSafe(section.heading), {
         x: 48,
         y: cursorY,
         size: 11,
@@ -668,7 +1157,7 @@ export async function generateSamplePdfBatch(count = 5): Promise<
       cursorY -= 20;
 
       for (const line of section.lines) {
-        page.drawText(line, {
+        page.drawText(toWinAnsiSafe(line), {
           x: 56,
           y: cursorY,
           size: 10.5,
